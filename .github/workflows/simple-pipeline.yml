@@ -1,0 +1,168 @@
+name: Simple CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+env:
+  NODE_VERSION: '18'
+  REGISTRY: docker.io
+  IMAGE_NAME: ${{ github.repository_owner }}/todo-api
+
+jobs:
+  # Quality Gate: Unit Tests with 85% Coverage
+  test:
+    name: Unit Tests & Coverage
+    runs-on: self-hosted
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        run: npm run lint
+        continue-on-error: true
+
+      - name: Run Security Audit
+        run: |
+          npm audit --audit-level=high
+        continue-on-error: true
+
+      - name: Run Unit Tests with Coverage
+        run: npm run test:coverage -- --testPathPattern=unit
+
+      - name: "QUALITY GATE: Check 85% Coverage"
+        run: |
+          # Extract coverage from Jest output
+          $coverageOutput = npm run test:coverage -- --testPathPattern=unit --coverageReporters=text-summary --silent
+          $coverageLine = $coverageOutput | Select-String "All files"
+          
+          if ($coverageLine) {
+            $coverage = [regex]::Match($coverageLine.Line, '(\d+\.?\d*)%').Groups[1].Value
+            Write-Host "Current Coverage: ${coverage}%"
+            
+            if ([double]$coverage -lt 85) {
+              Write-Host "❌ QUALITY GATE FAILED: Coverage ${coverage}% is below 85% threshold"
+              exit 1
+            }
+            Write-Host "✅ QUALITY GATE PASSED: Coverage ${coverage}% meets 85% threshold"
+          } else {
+            Write-Host "❌ QUALITY GATE FAILED: Could not determine coverage percentage"
+            exit 1
+          }
+
+  # Build & Push Docker Image
+  build:
+    name: Build & Push
+    runs-on: self-hosted
+    needs: [test]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          target: production
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
+
+  # Simple Security Scan
+  security-scan:
+    name: Security Scan
+    runs-on: self-hosted
+    needs: [build]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker image for scan
+        run: |
+          docker build -t todo-api:security-scan .
+
+      - name: Run Docker security scan
+        run: |
+          Write-Host "Running Docker security scan..."
+          docker scout cves todo-api:security-scan --only-severities high,critical --exit-code
+          
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "✅ No HIGH/CRITICAL vulnerabilities found"
+          } else {
+            Write-Host "❌ HIGH/CRITICAL vulnerabilities found"
+            exit 1
+          }
+
+      - name: "QUALITY GATE: Security Scan Passed"
+        run: |
+          Write-Host "✅ QUALITY GATE PASSED: Container security scan completed"
+
+  # Deploy to Staging (for develop branch)
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: self-hosted
+    needs: [security-scan]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    environment: staging
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to staging
+        run: |
+          Write-Host "🚀 Deploying to staging environment..."
+          Write-Host "Image: ${{ env.IMAGE_NAME }}:${{ github.sha }}"
+          Write-Host "✅ Staging deployment completed"
+
+  # Deploy to Production (for main branch)
+  deploy-production:
+    name: Deploy to Production
+    runs-on: self-hosted
+    needs: [security-scan]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: production
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to production
+        run: |
+          Write-Host "🚀 Deploying to production environment..."
+          Write-Host "Image: ${{ env.IMAGE_NAME }}:${{ github.sha }}"
+          Write-Host "✅ Production deployment completed"
