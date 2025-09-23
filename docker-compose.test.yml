@@ -1,0 +1,54 @@
+version: '3.8'
+
+services:
+  # Test PostgreSQL Database
+  postgres-test:
+    image: postgres:15-alpine
+    container_name: todo-postgres-test
+    environment:
+      POSTGRES_DB: todo_test_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_test_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - test-network
+
+  # Test Todo API Application
+  todo-api-test:
+    build:
+      context: .
+      target: development
+    container_name: todo-api-test
+    environment:
+      NODE_ENV: test
+      PORT: 3000
+      DATABASE_URL: postgresql://postgres:password@postgres-test:5432/todo_test_db
+      LOG_LEVEL: debug
+    ports:
+      - "3001:3000"
+    depends_on:
+      postgres-test:
+        condition: service_healthy
+    volumes:
+      - .:/app
+      - /app/node_modules
+    networks:
+      - test-network
+    command: npm test
+
+volumes:
+  postgres_test_data:
+
+networks:
+  test-network:
+    driver: bridge
+

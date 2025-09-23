@@ -1,0 +1,542 @@
+name: Enterprise CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+env:
+  NODE_VERSION: '18'
+  REGISTRY: docker.io
+  IMAGE_NAME: ${{ github.repository_owner }}/todo-api
+
+jobs:
+  # Job 1: Code Quality & Security (SAST)
+  code-quality:
+    name: Code Quality & Security Scan
+    runs-on: self-hosted
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        run: npm run lint
+        continue-on-error: true
+
+      - name: Run Security Audit
+        run: |
+          npm audit --audit-level=high
+        continue-on-error: true
+
+      - name: Run SonarQube Scan
+        uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        continue-on-error: true
+
+      - name: Check for HIGH severity vulnerabilities
+        run: |
+          # Check npm audit for HIGH severity issues
+          if npm audit --audit-level=high --json | jq '.vulnerabilities | to_entries | map(select(.value.severity == "high")) | length' | grep -v "^0$"; then
+            echo "❌ HIGH severity vulnerabilities found!"
+            exit 1
+          fi
+          echo "✅ No HIGH severity vulnerabilities found"
+
+  # Job 2: Unit & Integration Testing
+  test:
+    name: Unit & Integration Tests
+    runs-on: self-hosted
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: todo_test_db
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Wait for PostgreSQL
+        run: |
+          # Wait for PostgreSQL to be ready on Windows
+          do {
+            try {
+              $connection = New-Object System.Data.SqlClient.SqlConnection("Server=localhost,5432;Database=postgres;User Id=postgres;Password=password;")
+              $connection.Open()
+              $connection.Close()
+              Write-Host "PostgreSQL is ready"
+              break
+            } catch {
+              Write-Host "Waiting for PostgreSQL..."
+              Start-Sleep -Seconds 2
+            }
+          } while ($true)
+
+      - name: Create test database
+        run: |
+          $env:PGPASSWORD = "password"
+          psql -h localhost -U postgres -c "CREATE DATABASE todo_test_db;"
+
+      - name: Run database migrations
+        run: |
+          $env:PGPASSWORD = "password"
+          psql -h localhost -U postgres -d todo_test_db -f database/init.sql
+
+      - name: Run unit tests with coverage
+        run: npm run test:coverage
+        env:
+          TEST_DATABASE_URL: postgresql://postgres:password@localhost:5432/todo_test_db
+
+      - name: Run integration tests
+        run: npm run test:integration
+        env:
+          TEST_DATABASE_URL: postgresql://postgres:password@localhost:5432/todo_test_db
+
+      - name: Upload coverage reports
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage/lcov.info
+          flags: unittests
+          name: codecov-umbrella
+
+      - name: Check coverage threshold
+        run: |
+          COVERAGE=$(npm run test:coverage -- --coverageReporters=text-summary | grep -o 'All files[[:space:]]*\|[[:space:]]*[0-9]*\.[0-9]*%' | tail -1 | sed 's/%//')
+          echo "Coverage: ${COVERAGE}%"
+          if (( $(echo "$COVERAGE < 85" | bc -l) )); then
+            echo "❌ Coverage ${COVERAGE}% is below 85% threshold"
+            exit 1
+          fi
+          echo "✅ Coverage ${COVERAGE}% meets 85% threshold"
+
+  # Job 3: Build & Containerization
+  build:
+    name: Build & Push Docker Image
+    runs-on: self-hosted
+    needs: [code-quality, test]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          target: production
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
+
+  # Job 4: Performance Testing
+  performance-test:
+    name: Performance Testing
+    runs-on: self-hosted
+    needs: [build]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install k6
+        run: |
+          sudo gpg -k
+          sudo gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update
+          sudo apt-get install k6
+
+      - name: Start application
+        run: |
+          docker run -d --name todo-api-test \
+            -p 3000:3000 \
+            -e NODE_ENV=test \
+            -e DATABASE_URL=postgresql://postgres:password@host.docker.internal:5432/todo_db \
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+        continue-on-error: true
+
+      - name: Wait for application to be ready
+        run: |
+          for ($i = 1; $i -le 30; $i++) {
+            try {
+              $response = Invoke-WebRequest -Uri "http://localhost:3000/health" -UseBasicParsing
+              if ($response.StatusCode -eq 200) {
+                Write-Host "Application is ready"
+                break
+              }
+            } catch {
+              Write-Host "Waiting for application... ($i/30)"
+              Start-Sleep -Seconds 10
+            }
+          }
+
+      - name: Run performance tests
+        run: |
+          k6 run tests/performance/load-test.js --out json=performance-results.json
+        env:
+          BASE_URL: http://localhost:3000
+
+      - name: Check performance thresholds
+        run: |
+          P95_TIME=$(cat performance-results.json | jq -r '.metrics.http_req_duration.values.p95')
+          echo "P95 Response Time: ${P95_TIME}ms"
+          if (( $(echo "$P95_TIME > 200" | bc -l) )); then
+            echo "❌ P95 response time ${P95_TIME}ms exceeds 200ms threshold"
+            exit 1
+          fi
+          echo "✅ P95 response time ${P95_TIME}ms meets 200ms threshold"
+
+      - name: Upload performance results
+        uses: actions/upload-artifact@v3
+        with:
+          name: performance-results
+          path: performance-results.json
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f todo-api-test
+
+  # Job 5: Security Scanning (Container)
+  container-scan:
+    name: Container Security Scan
+    runs-on: self-hosted
+    needs: [build]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Check for HIGH/CRITICAL vulnerabilities
+        run: |
+          trivy image --exit-code 1 --severity HIGH,CRITICAL ${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+  # Job 6: Deploy to Staging
+  deploy-to-staging:
+    name: Deploy to Staging
+    runs-on: self-hosted
+    needs: [performance-test, container-scan]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    environment: staging
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Docker Compose
+        run: |
+          # Check if Docker Compose is already installed
+          if (Get-Command docker-compose -ErrorAction SilentlyContinue) {
+            Write-Host "Docker Compose is already installed"
+          } else {
+            # Download and install Docker Compose for Windows
+            $dockerComposeUrl = "https://github.com/docker/compose/releases/latest/download/docker-compose-Windows-x86_64.exe"
+            $dockerComposePath = "$env:ProgramFiles\Docker\Docker\resources\bin\docker-compose.exe"
+            Invoke-WebRequest -Uri $dockerComposeUrl -OutFile $dockerComposePath
+            Write-Host "Docker Compose installed successfully"
+          }
+
+      - name: Create environment file
+        run: |
+          echo "DOCKER_IMAGE=${{ env.IMAGE_NAME }}:${{ github.sha }}" > .env.staging
+          echo "POSTGRES_PASSWORD=staging_password_$(openssl rand -hex 8)" >> .env.staging
+          echo "ALLOWED_ORIGINS=https://staging-todo-api.example.com" >> .env.staging
+
+      - name: Deploy to staging
+        run: |
+          echo "Deploying to staging environment..."
+          docker-compose -f docker-compose.staging.yml --env-file .env.staging up -d
+          
+          # Wait for services to be healthy
+          $timeout = 300
+          $elapsed = 0
+          do {
+            $status = docker-compose -f docker-compose.staging.yml ps
+            if ($status -match "healthy") {
+              Write-Host "Services are healthy"
+              break
+            }
+            Start-Sleep -Seconds 5
+            $elapsed += 5
+          } while ($elapsed -lt $timeout)
+          
+          echo "✅ Successfully deployed to staging"
+
+  # Job 7: Smoke Tests
+  staging-smoke-tests:
+    name: Staging Smoke Tests
+    runs-on: self-hosted
+    needs: [deploy-to-staging]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run smoke tests
+        run: npm run test -- tests/smoke/
+        env:
+          BASE_URL: ${{ secrets.STAGING_URL }}
+
+      - name: Health check
+        run: |
+          try {
+            $response = Invoke-WebRequest -Uri "${{ secrets.STAGING_URL }}/health" -UseBasicParsing
+            if ($response.StatusCode -eq 200) {
+              Write-Host "✅ Health check passed"
+            } else {
+              exit 1
+            }
+          } catch {
+            Write-Host "Health check failed"
+            exit 1
+          }
+
+      - name: API functionality test
+        run: |
+          # Test GET /tasks
+          try {
+            $response = Invoke-WebRequest -Uri "${{ secrets.STAGING_URL }}/tasks" -UseBasicParsing
+            if ($response.StatusCode -eq 200) {
+              Write-Host "✅ GET /tasks test passed"
+            } else {
+              exit 1
+            }
+          } catch {
+            Write-Host "GET /tasks test failed"
+            exit 1
+          }
+          
+          # Test POST /tasks
+          $body = @{
+            title = "Smoke Test Task"
+            description = "Smoke test"
+            priority = "medium"
+          } | ConvertTo-Json
+          
+          try {
+            $response = Invoke-WebRequest -Uri "${{ secrets.STAGING_URL }}/tasks" -Method POST -Body $body -ContentType "application/json" -UseBasicParsing
+            $taskData = $response.Content | ConvertFrom-Json
+            $taskId = $taskData.task.id
+            
+            if ($taskId -and $taskId -ne "null") {
+              Write-Host "✅ POST /tasks test passed"
+            } else {
+              Write-Host "❌ POST /tasks test failed"
+              exit 1
+            }
+          } catch {
+            Write-Host "❌ POST /tasks test failed"
+            exit 1
+          }
+
+  # Job 8: Deploy to Production
+  deploy-to-production:
+    name: Deploy to Production
+    runs-on: self-hosted
+    needs: [staging-smoke-tests]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: production
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Docker Compose
+        run: |
+          # Check if Docker Compose is already installed
+          if (Get-Command docker-compose -ErrorAction SilentlyContinue) {
+            Write-Host "Docker Compose is already installed"
+          } else {
+            # Download and install Docker Compose for Windows
+            $dockerComposeUrl = "https://github.com/docker/compose/releases/latest/download/docker-compose-Windows-x86_64.exe"
+            $dockerComposePath = "$env:ProgramFiles\Docker\Docker\resources\bin\docker-compose.exe"
+            Invoke-WebRequest -Uri $dockerComposeUrl -OutFile $dockerComposePath
+            Write-Host "Docker Compose installed successfully"
+          }
+
+      - name: Create environment file
+        run: |
+          echo "DOCKER_IMAGE=${{ env.IMAGE_NAME }}:${{ github.sha }}" > .env.production
+          echo "POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}" >> .env.production
+          echo "POSTGRES_USER=${{ secrets.POSTGRES_USER }}" >> .env.production
+          echo "ALLOWED_ORIGINS=https://todo-api.example.com" >> .env.production
+          echo "REDIS_PASSWORD=${{ secrets.REDIS_PASSWORD }}" >> .env.production
+
+      - name: Deploy to production
+        run: |
+          echo "Deploying to production environment..."
+          
+          # Blue-green deployment strategy
+          docker-compose -f docker-compose.production.yml --env-file .env.production up -d --scale todo-api-production=0
+          docker-compose -f docker-compose.production.yml --env-file .env.production up -d --scale todo-api-production=2
+          
+          # Wait for services to be healthy
+          $timeout = 300
+          $elapsed = 0
+          do {
+            $status = docker-compose -f docker-compose.production.yml ps
+            if ($status -match "healthy") {
+              Write-Host "Services are healthy"
+              break
+            }
+            Start-Sleep -Seconds 5
+            $elapsed += 5
+          } while ($elapsed -lt $timeout)
+          
+          echo "✅ Successfully deployed to production"
+
+  # Job 9: Post-deployment Verification
+  post-deployment-verification:
+    name: Post-deployment Verification
+    runs-on: self-hosted
+    needs: [deploy-to-production]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run production smoke tests
+        run: npm run test -- tests/smoke/
+        env:
+          BASE_URL: ${{ secrets.PRODUCTION_URL }}
+
+      - name: Health check
+        run: |
+          try {
+            $response = Invoke-WebRequest -Uri "${{ secrets.PRODUCTION_URL }}/health" -UseBasicParsing
+            if ($response.StatusCode -eq 200) {
+              Write-Host "✅ Production health check passed"
+            } else {
+              exit 1
+            }
+          } catch {
+            Write-Host "Production health check failed"
+            exit 1
+          }
+
+      - name: Performance verification
+        run: |
+          $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+          try {
+            $response = Invoke-WebRequest -Uri "${{ secrets.PRODUCTION_URL }}/health" -UseBasicParsing
+            $stopwatch.Stop()
+            $responseTime = $stopwatch.Elapsed.TotalSeconds
+            Write-Host "Response time: ${responseTime}s"
+            
+            if ($responseTime -gt 1.0) {
+              Write-Host "❌ Response time ${responseTime}s exceeds 1s threshold"
+              exit 1
+            }
+            Write-Host "✅ Response time ${responseTime}s meets threshold"
+          } catch {
+            Write-Host "Performance verification failed"
+            exit 1
+          }
+
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          echo "❌ Post-deployment verification failed - initiating rollback"
+          
+          # Rollback to previous version
+          docker-compose -f docker-compose.production.yml --env-file .env.production down
+          docker-compose -f docker-compose.production.yml --env-file .env.production up -d
+          
+          echo "🔄 Rollback initiated"

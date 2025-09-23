@@ -1,0 +1,73 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database for Staging
+  postgres-staging:
+    image: postgres:15-alpine
+    container_name: todo-postgres-staging
+    environment:
+      POSTGRES_DB: todo_staging_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-staging_password}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_staging_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - staging-network
+    restart: unless-stopped
+
+  # Todo API Application - Staging
+  todo-api-staging:
+    image: ${DOCKER_IMAGE:-naimjeem/todo-api:develop}
+    container_name: todo-api-staging
+    environment:
+      NODE_ENV: staging
+      PORT: 3000
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-staging_password}@postgres-staging:5432/todo_staging_db
+      LOG_LEVEL: info
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000,https://staging-todo-api.example.com}
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres-staging:
+        condition: service_healthy
+    networks:
+      - staging-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Nginx Reverse Proxy for Staging
+  nginx-staging:
+    image: nginx:alpine
+    container_name: nginx-staging
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/staging.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - todo-api-staging
+    networks:
+      - staging-network
+    restart: unless-stopped
+
+volumes:
+  postgres_staging_data:
+
+networks:
+  staging-network:
+    driver: bridge
+

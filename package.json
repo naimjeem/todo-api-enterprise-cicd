@@ -1,0 +1,71 @@
+{
+  "name": "todo-api",
+  "version": "1.0.0",
+  "description": "Enterprise-grade Todo API with comprehensive CI/CD pipeline",
+  "main": "src/app.js",
+  "scripts": {
+    "start": "node src/app.js",
+    "dev": "nodemon src/app.js",
+    "test": "jest",
+    "test:coverage": "jest --coverage",
+    "test:integration": "jest --testPathPattern=integration",
+    "lint": "eslint src/ tests/",
+    "lint:fix": "eslint src/ tests/ --fix",
+    "security:audit": "npm audit",
+    "security:audit:fix": "npm audit fix",
+    "docker:build": "docker build -t todo-api .",
+    "docker:run": "docker run -p 3000:3000 todo-api",
+    "performance:test": "k6 run tests/performance/load-test.js",
+    "sonar:scan": "./scripts/sonar-scan.sh"
+  },
+  "keywords": ["todo", "api", "express", "postgresql", "ci-cd"],
+  "author": "Enterprise Team",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "helmet": "^7.1.0",
+    "express-rate-limit": "^7.1.5",
+    "pg": "^8.11.3",
+    "dotenv": "^16.3.1",
+    "joi": "^17.11.0",
+    "winston": "^3.11.0",
+    "express-validator": "^7.0.1",
+    "compression": "^1.7.4"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "supertest": "^6.3.3",
+    "nodemon": "^3.0.2",
+    "eslint": "^8.55.0",
+    "eslint-config-standard": "^17.1.0",
+    "eslint-plugin-import": "^2.29.0",
+    "eslint-plugin-node": "^11.1.0",
+    "eslint-plugin-promise": "^6.1.1",
+    "eslint-plugin-security": "^1.7.1",
+    "jest-environment-node": "^29.7.0",
+    "k6": "^0.0.0"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "collectCoverageFrom": [
+      "src/**/*.js",
+      "!src/app.js"
+    ],
+    "coverageThreshold": {
+      "global": {
+        "branches": 85,
+        "functions": 85,
+        "lines": 85,
+        "statements": 85
+      }
+    },
+    "testMatch": [
+      "**/tests/**/*.test.js"
+    ]
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=8.0.0"
+  }
+}

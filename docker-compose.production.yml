@@ -1,0 +1,119 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database for Production
+  postgres-production:
+    image: postgres:15-alpine
+    container_name: todo-postgres-production
+    environment:
+      POSTGRES_DB: todo_production_db
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_production_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./database/backups:/backups
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - production-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '1.0'
+        reservations:
+          memory: 1G
+          cpus: '0.5'
+
+  # Todo API Application - Production
+  todo-api-production:
+    image: ${DOCKER_IMAGE:-naimjeem/todo-api:latest}
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@postgres-production:5432/todo_production_db
+      LOG_LEVEL: warn
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-https://todo-api.example.com}
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres-production:
+        condition: service_healthy
+    networks:
+      - production-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1.0'
+        reservations:
+          memory: 512M
+          cpus: '0.5'
+      replicas: 2
+
+  # Nginx Reverse Proxy for Production
+  nginx-production:
+    image: nginx:alpine
+    container_name: nginx-production
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/production.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - todo-api-production
+    networks:
+      - production-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.5'
+        reservations:
+          memory: 128M
+          cpus: '0.25'
+
+  # Redis for Session Storage (Optional)
+  redis-production:
+    image: redis:7-alpine
+    container_name: redis-production
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_production_data:/data
+    networks:
+      - production-network
+    restart: unless-stopped
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-redis_password}
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+        reservations:
+          memory: 256M
+          cpus: '0.25'
+
+volumes:
+  postgres_production_data:
+  redis_production_data:
+
+networks:
+  production-network:
+    driver: bridge

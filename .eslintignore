@@ -1,0 +1,14 @@
+node_modules/
+coverage/
+dist/
+build/
+*.min.js
+.env
+.env.local
+.env.production
+.env.test
+logs/
+*.log
+.DS_Store
+Thumbs.db
+
