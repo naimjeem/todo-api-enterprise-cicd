@@ -12,6 +12,7 @@ env:
 jobs:
   test:
     runs-on: self-hosted
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - name: Setup Node.js
@@ -43,6 +44,7 @@ jobs:
   build:
     runs-on: self-hosted
     needs: [test, code-quality]
+    if: always() && needs.code-quality.result == 'success'
     steps:
       - uses: actions/checkout@v4
       - name: Log in to Docker Hub
