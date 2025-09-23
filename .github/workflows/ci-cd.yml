@@ -60,19 +60,6 @@ jobs:
   test:
     name: Unit & Integration Tests
     runs-on: self-hosted
-    services:
-      postgres:
-        image: postgres:15
-        env:
-          POSTGRES_PASSWORD: password
-          POSTGRES_DB: todo_test_db
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 5432:5432
 
     steps:
       - name: Checkout code
@@ -87,31 +74,44 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Start PostgreSQL with Docker Compose
+        run: |
+          # Start PostgreSQL using the existing test docker-compose file
+          docker-compose -f docker-compose.test.yml up -d postgres-test
+          
+          # Wait for PostgreSQL to be ready
+          Write-Host "Waiting for PostgreSQL to start..."
+          Start-Sleep -Seconds 10
+
       - name: Wait for PostgreSQL
         run: |
-          # Wait for PostgreSQL to be ready on Windows
+          # Wait for PostgreSQL to be ready on Windows (using default port 5432)
+          $maxAttempts = 30
+          $attempt = 0
           do {
             try {
-              $connection = New-Object System.Data.SqlClient.SqlConnection("Server=localhost,5432;Database=postgres;User Id=postgres;Password=password;")
+              $connection = New-Object System.Data.SqlClient.SqlConnection("Server=localhost;Port=5432;Database=postgres;User Id=postgres;Password=password;")
               $connection.Open()
               $connection.Close()
               Write-Host "PostgreSQL is ready"
               break
             } catch {
-              Write-Host "Waiting for PostgreSQL..."
+              $attempt++
+              Write-Host "Waiting for PostgreSQL... (attempt $attempt/$maxAttempts)"
               Start-Sleep -Seconds 2
             }
-          } while ($true)
-
-      - name: Create test database
-        run: |
-          $env:PGPASSWORD = "password"
-          psql -h localhost -U postgres -c "CREATE DATABASE todo_test_db;"
+          } while ($attempt -lt $maxAttempts)
+          
+          if ($attempt -eq $maxAttempts) {
+            Write-Host "PostgreSQL failed to start"
+            exit 1
+          }
 
       - name: Run database migrations
         run: |
-          $env:PGPASSWORD = "password"
-          psql -h localhost -U postgres -d todo_test_db -f database/init.sql
+          # The init.sql is already mounted and will run automatically
+          # Just verify the database is ready
+          docker-compose -f docker-compose.test.yml exec -T postgres-test psql -U postgres -d todo_test_db -c "SELECT 1;"
 
       - name: Run unit tests with coverage
         run: npm run test:coverage
@@ -132,13 +132,27 @@ jobs:
 
       - name: Check coverage threshold
         run: |
-          COVERAGE=$(npm run test:coverage -- --coverageReporters=text-summary | grep -o 'All files[[:space:]]*\|[[:space:]]*[0-9]*\.[0-9]*%' | tail -1 | sed 's/%//')
-          echo "Coverage: ${COVERAGE}%"
-          if (( $(echo "$COVERAGE < 85" | bc -l) )); then
-            echo "❌ Coverage ${COVERAGE}% is below 85% threshold"
+          # Get coverage percentage using PowerShell
+          $coverageOutput = npm run test:coverage -- --coverageReporters=text-summary
+          $coverageLine = $coverageOutput | Select-String "All files"
+          if ($coverageLine) {
+            $coverage = [regex]::Match($coverageLine.Line, '(\d+\.?\d*)%').Groups[1].Value
+            Write-Host "Coverage: ${coverage}%"
+            if ([double]$coverage -lt 85) {
+              Write-Host "❌ Coverage ${coverage}% is below 85% threshold"
+              exit 1
+            }
+            Write-Host "✅ Coverage ${coverage}% meets 85% threshold"
+          } else {
+            Write-Host "❌ Could not determine coverage percentage"
             exit 1
-          fi
-          echo "✅ Coverage ${COVERAGE}% meets 85% threshold"
+          }
+
+      - name: Cleanup PostgreSQL container
+        if: always()
+        run: |
+          # Stop and remove PostgreSQL using docker-compose
+          docker-compose -f docker-compose.test.yml down -v
 
   # Job 3: Build & Containerization
   build:
@@ -205,11 +219,13 @@ jobs:
 
       - name: Install k6
         run: |
-          sudo gpg -k
-          sudo gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
-          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
-          sudo apt-get update
-          sudo apt-get install k6
+          # Download and install k6 for Windows
+          $k6Url = "https://github.com/grafana/k6/releases/latest/download/k6-v0.47.0-windows-amd64.zip"
+          $k6Zip = "k6.zip"
+          Invoke-WebRequest -Uri $k6Url -OutFile $k6Zip -UseBasicParsing
+          Expand-Archive -Path $k6Zip -DestinationPath "C:\k6" -Force
+          $env:PATH += ";C:\k6"
+          Write-Host "k6 installed successfully"
 
       - name: Start application
         run: |
@@ -243,13 +259,20 @@ jobs:
 
       - name: Check performance thresholds
         run: |
-          P95_TIME=$(cat performance-results.json | jq -r '.metrics.http_req_duration.values.p95')
-          echo "P95 Response Time: ${P95_TIME}ms"
-          if (( $(echo "$P95_TIME > 200" | bc -l) )); then
-            echo "❌ P95 response time ${P95_TIME}ms exceeds 200ms threshold"
+          # Parse k6 JSON results using PowerShell
+          if (Test-Path "performance-results.json") {
+            $results = Get-Content "performance-results.json" | ConvertFrom-Json
+            $p95Time = $results.metrics.http_req_duration.values.p95
+            Write-Host "P95 Response Time: ${p95Time}ms"
+            if ($p95Time -gt 200) {
+              Write-Host "❌ P95 response time ${p95Time}ms exceeds 200ms threshold"
+              exit 1
+            }
+            Write-Host "✅ P95 response time ${p95Time}ms meets 200ms threshold"
+          } else {
+            Write-Host "❌ Performance results file not found"
             exit 1
-          fi
-          echo "✅ P95 response time ${P95_TIME}ms meets 200ms threshold"
+          }
 
       - name: Upload performance results
         uses: actions/upload-artifact@v3

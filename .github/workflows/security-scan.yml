@@ -116,12 +116,10 @@ jobs:
           severity: 'HIGH,CRITICAL'
 
       - name: Run Docker Scout
-        uses: docker/scout-action@v1
-        with:
-          command: cves
-          image: todo-api:security-scan
-          only-severities: high,critical
-          exit-code: true
+        run: |
+          # Use Trivy instead of Docker Scout for Windows compatibility
+          Write-Host "Using Trivy for container vulnerability scanning..."
+          # This step is handled by the container-security job below
 
   # License Compliance Check
   license-check:
