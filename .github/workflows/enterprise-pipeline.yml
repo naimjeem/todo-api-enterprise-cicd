@@ -5,6 +5,8 @@ on:
     branches: [ main, develop ]
   pull_request:
     branches: [ main, develop ]
+  schedule:
+    - cron: '0 2 * * *' # Daily security scan at 2 AM
 
 env:
   NODE_VERSION: '18'
@@ -43,24 +45,65 @@ jobs:
       - name: Run SonarQube Scan
         uses: SonarSource/sonarcloud-github-action@master
         env:
-          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         continue-on-error: true
 
       - name: Check for HIGH severity vulnerabilities
         run: |
           # Check npm audit for HIGH severity issues
-          if npm audit --audit-level=high --json | jq '.vulnerabilities | to_entries | map(select(.value.severity == "high")) | length' | grep -v "^0$"; then
-            echo "❌ HIGH severity vulnerabilities found!"
+          $auditResult = npm audit --audit-level=high --json | ConvertFrom-Json
+          $highVulns = $auditResult.vulnerabilities | Where-Object { $_.severity -eq "high" }
+          if ($highVulns.Count -gt 0) {
+            Write-Host "❌ HIGH severity vulnerabilities found!"
+            $highVulns | ForEach-Object { Write-Host "  - $($_.name): $($_.title)" }
             exit 1
-          fi
-          echo "✅ No HIGH severity vulnerabilities found"
+          }
+          Write-Host "✅ No HIGH severity vulnerabilities found"
 
-  # Job 2: Unit & Integration Testing
+  # Job 2: Dependency Security Scan
+  dependency-scan:
+    name: Dependency Security Scan
+    runs-on: self-hosted
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run Snyk to check for vulnerabilities
+        uses: snyk/actions/node@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: >
+            --enableRetired
+            --enableExperimental
+            --failOnCVSS 7
+
+      - name: Run npm audit with detailed output
+        run: |
+          npm audit --audit-level=moderate --json > audit-results.json
+          $auditData = Get-Content audit-results.json | ConvertFrom-Json
+          $highVulns = $auditData.vulnerabilities | Where-Object { $_.severity -eq "high" }
+          if ($highVulns.Count -gt 0) {
+            Write-Host "❌ HIGH severity vulnerabilities found:"
+            $highVulns | ForEach-Object { Write-Host "  - $($_.name): $($_.title)" }
+            exit 1
+          }
+          Write-Host "✅ No HIGH severity vulnerabilities found"
+
+  # Job 3: Unit & Integration Testing
   test:
     name: Unit & Integration Tests
     runs-on: self-hosted
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -154,11 +197,32 @@ jobs:
           # Stop and remove PostgreSQL using docker-compose
           docker-compose -f docker-compose.test.yml down -v
 
-  # Job 3: Build & Containerization
+  # Job 4: License Compliance Check
+  license-check:
+    name: License Compliance Check
+    runs-on: self-hosted
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run license check
+        run: |
+          npx license-checker --onlyAllow 'MIT;Apache-2.0;BSD-2-Clause;BSD-3-Clause;ISC;Unlicense' --excludePrivatePackages
+
+  # Job 5: Build & Containerization
   build:
     name: Build & Push Docker Image
     runs-on: self-hosted
-    needs: [code-quality, test]
+    needs: [code-quality, dependency-scan, test, license-check]
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
     
     steps:
@@ -197,7 +261,46 @@ jobs:
           cache-to: type=gha,mode=max
           platforms: linux/amd64,linux/arm64
 
-  # Job 4: Performance Testing
+  # Job 6: Container Security Scanning
+  container-security:
+    name: Container Security Scan
+    runs-on: self-hosted
+    needs: [build]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker image for security scan
+        run: |
+          docker build -t todo-api:security-scan .
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'todo-api:security-scan'
+          format: 'table'
+          exit-code: '1'
+          severity: 'HIGH,CRITICAL'
+
+      - name: Run Trivy vulnerability scanner (SARIF)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'todo-api:security-scan'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Check for HIGH/CRITICAL vulnerabilities
+        run: |
+          trivy image --exit-code 1 --severity HIGH,CRITICAL todo-api:security-scan
+
+  # Job 7: Performance Testing
   performance-test:
     name: Performance Testing
     runs-on: self-hosted
@@ -284,9 +387,9 @@ jobs:
         if: always()
         run: docker rm -f todo-api-test
 
-  # Job 5: Security Scanning (Container)
-  container-scan:
-    name: Container Security Scan
+  # Job 8: Security Headers Check
+  security-headers:
+    name: Security Headers Check
     runs-on: self-hosted
     needs: [build]
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
@@ -295,27 +398,73 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@master
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
-          image-ref: ${{ env.IMAGE_NAME }}:${{ github.sha }}
-          format: 'sarif'
-          output: 'trivy-results.sarif'
+          node-version: '18'
+          cache: 'npm'
 
-      - name: Upload Trivy scan results to GitHub Security tab
-        uses: github/codeql-action/upload-sarif@v2
-        with:
-          sarif_file: 'trivy-results.sarif'
+      - name: Install dependencies
+        run: npm ci
 
-      - name: Check for HIGH/CRITICAL vulnerabilities
+      - name: Start application for security testing
         run: |
-          trivy image --exit-code 1 --severity HIGH,CRITICAL ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          docker run -d --name todo-api-security-test \
+            -p 3000:3000 \
+            -e NODE_ENV=test \
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
 
-  # Job 6: Deploy to Staging
+      - name: Wait for application
+        run: |
+          Start-Sleep -Seconds 10
+          for ($i = 1; $i -le 10; $i++) {
+            try {
+              $response = Invoke-WebRequest -Uri "http://localhost:3000/health" -UseBasicParsing
+              if ($response.StatusCode -eq 200) {
+                Write-Host "Application is ready for security testing"
+                break
+              }
+            } catch {
+              Write-Host "Waiting for application... ($i/10)"
+              Start-Sleep -Seconds 5
+            }
+          }
+
+      - name: Check security headers
+        run: |
+          $response = Invoke-WebRequest -Uri "http://localhost:3000/health" -UseBasicParsing
+          $headers = $response.Headers
+          
+          $requiredHeaders = @(
+            "X-Content-Type-Options",
+            "X-Frame-Options", 
+            "X-XSS-Protection",
+            "Strict-Transport-Security"
+          )
+          
+          $missingHeaders = @()
+          foreach ($header in $requiredHeaders) {
+            if (-not $headers.ContainsKey($header)) {
+              $missingHeaders += $header
+            }
+          }
+          
+          if ($missingHeaders.Count -gt 0) {
+            Write-Host "❌ Missing security headers: $($missingHeaders -join ', ')"
+            exit 1
+          }
+          
+          Write-Host "✅ All required security headers present"
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f todo-api-security-test
+
+  # Job 9: Deploy to Staging
   deploy-to-staging:
     name: Deploy to Staging
     runs-on: self-hosted
-    needs: [performance-test, container-scan]
+    needs: [performance-test, container-security, security-headers]
     if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
     environment: staging
     
@@ -362,7 +511,7 @@ jobs:
           
           echo "✅ Successfully deployed to staging"
 
-  # Job 7: Smoke Tests
+  # Job 10: Smoke Tests
   staging-smoke-tests:
     name: Staging Smoke Tests
     runs-on: self-hosted
@@ -439,7 +588,7 @@ jobs:
             exit 1
           }
 
-  # Job 8: Deploy to Production
+  # Job 11: Deploy to Production
   deploy-to-production:
     name: Deploy to Production
     runs-on: self-hosted
@@ -495,7 +644,7 @@ jobs:
           
           echo "✅ Successfully deployed to production"
 
-  # Job 9: Post-deployment Verification
+  # Job 12: Post-deployment Verification
   post-deployment-verification:
     name: Post-deployment Verification
     runs-on: self-hosted
