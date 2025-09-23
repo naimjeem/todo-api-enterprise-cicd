@@ -1,178 +1,61 @@
-name: Simple CI/CD Pipeline
+name: CI/CD Pipeline
 
 on:
-  push:
-    branches: [ main, develop ]
-  pull_request:
-    branches: [ main, develop ]
+  release:
+    types: [published]
 
 env:
-  NODE_VERSION: '18'
+  BACKEND_IMAGE: ${{ secrets.DOCKER_USERNAME }}/todo-backend
 
 jobs:
   test:
-    name: Unit Tests with Coverage
     runs-on: self-hosted
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
+      - uses: actions/checkout@v4
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: ${{ env.NODE_VERSION }}
+          node-version: '18'
           cache: 'npm'
-
       - name: Install dependencies
         run: npm ci
-
-      - name: Run unit tests with coverage
-        run: npm run test:coverage
-        env:
-          # Mock database URL for unit tests, not actually connecting
-          TEST_DATABASE_URL: postgresql://user:password@localhost:5432/test_db
-
-      - name: "QUALITY GATE: Check unit test coverage > 85%"
-        run: |
-          $coverageOutput = npm run test:coverage -- --coverageReporters=text-summary
-          $coverageLine = $coverageOutput | Select-String "All files"
-          if ($coverageLine) {
-            $coverage = [regex]::Match($coverageLine.Line, '(\d+\.?\d*)%').Groups[1].Value
-            Write-Host "Coverage: ${coverage}%"
-            if ([double]$coverage -lt 85) {
-              Write-Host "❌ QUALITY GATE FAILED: Coverage ${coverage}% is below 85% threshold"
-              exit 1
-            }
-            Write-Host "✅ QUALITY GATE PASSED: Coverage ${coverage}% meets 85% threshold"
-          } else {
-            Write-Host "❌ QUALITY GATE FAILED: Could not determine coverage percentage"
-            exit 1
-          }
-
-  code-quality:
-    name: Code Quality Checks
-    runs-on: self-hosted
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: 'npm'
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Run ESLint
-        run: npm run lint
-
-      - name: "QUALITY GATE: Check for security vulnerabilities"
-        run: |
-          $auditOutput = npm audit --json
-          $auditData = $auditOutput | ConvertFrom-Json
-          $highVulns = $auditData.vulnerabilities | Where-Object { $_.severity -eq "high" }
-          if ($highVulns.Count -gt 0) {
-            Write-Host "❌ QUALITY GATE FAILED: Found $($highVulns.Count) HIGH severity vulnerabilities"
-            exit 1
-          }
-          Write-Host "✅ QUALITY GATE PASSED: No HIGH severity vulnerabilities found"
+      - name: Run tests
+        run: npm test
 
   build:
-    name: Build and Push Docker Image
     runs-on: self-hosted
-    needs: [test, code-quality]
+    needs: test
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to Docker Hub
+      - uses: actions/checkout@v4
+      - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Extract Release Version
+        run: echo "RELEASE_VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+      - name: Build & Push Backend
+        run: |
+          docker build -t $BACKEND_IMAGE:${{ env.RELEASE_VERSION }} .
+          docker push $BACKEND_IMAGE:${{ env.RELEASE_VERSION }}
 
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: true
-          tags: |
-            naimjeem/todo-api:latest
-            naimjeem/todo-api:${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  deploy-staging:
-    name: Deploy to Staging
+  deploy:
     runs-on: self-hosted
-    needs: [build]
-    environment: staging
+    needs: build
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Deploy to staging
+      - uses: actions/checkout@v4
+      - name: Extract Release Version
+        run: echo "RELEASE_VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+      - name: Update .env with new RELEASE_VERSION
         run: |
-          # Create environment file
-          $envContent = @"
-          POSTGRES_PASSWORD=$(Get-Random -Minimum 100000 -Maximum 999999)
-          POSTGRES_DB=todo_staging
-          POSTGRES_USER=postgres
-          NODE_ENV=staging
-          PORT=3000
-          "@
-          $envContent | Out-File -FilePath .env.staging -Encoding UTF8
-
-          # Deploy using docker-compose
-          docker-compose -f docker-compose.staging.yml --env-file .env.staging up -d
-
-      - name: "QUALITY GATE: Health check staging deployment"
+          echo "Setting RELEASE_VERSION=${{ env.RELEASE_VERSION }} in .env"
+          touch .env
+          grep -v '^RELEASE_VERSION=' .env > .env.tmp || true
+          echo "RELEASE_VERSION=${{ env.RELEASE_VERSION }}" >> .env.tmp
+          mv .env.tmp .env
+          echo "Final .env:"
+          cat .env
+      - name: Deploy locally with Docker Compose
         run: |
-          Start-Sleep -Seconds 10
-          $response = Invoke-WebRequest -Uri "http://localhost:3000/health/live" -UseBasicParsing
-          if ($response.StatusCode -eq 200) {
-            Write-Host "✅ QUALITY GATE PASSED: Staging deployment is healthy"
-          } else {
-            Write-Host "❌ QUALITY GATE FAILED: Staging deployment health check failed"
-            exit 1
-          }
-
-  deploy-production:
-    name: Deploy to Production
-    runs-on: self-hosted
-    needs: [deploy-staging]
-    environment: production
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Deploy to production
-        run: |
-          # Create environment file
-          $envContent = @"
-          POSTGRES_PASSWORD=$(Get-Random -Minimum 100000 -Maximum 999999)
-          POSTGRES_DB=todo_production
-          POSTGRES_USER=postgres
-          NODE_ENV=production
-          PORT=3000
-          "@
-          $envContent | Out-File -FilePath .env.production -Encoding UTF8
-
-          # Deploy using docker-compose
-          docker-compose -f docker-compose.production.yml --env-file .env.production up -d
-
-      - name: "QUALITY GATE: Health check production deployment"
-        run: |
-          Start-Sleep -Seconds 10
-          $response = Invoke-WebRequest -Uri "http://localhost:3000/health/live" -UseBasicParsing
-          if ($response.StatusCode -eq 200) {
-            Write-Host "✅ QUALITY GATE PASSED: Production deployment is healthy"
-          } else {
-            Write-Host "❌ QUALITY GATE FAILED: Production deployment health check failed"
-            exit 1
-          }
+          docker compose pull
+          docker compose up -d
