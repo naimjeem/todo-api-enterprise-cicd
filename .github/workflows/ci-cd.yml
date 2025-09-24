@@ -88,7 +88,7 @@ jobs:
   # 4. Performance Testing
   performance-testing:
     runs-on: self-hosted
-    # needs: build
+    needs: build
     steps:
       - uses: actions/checkout@v4
       - name: Setup Node.js
@@ -134,7 +134,7 @@ jobs:
   # 6. Smoke Tests & Deployment
   smoke-tests-deploy:
     runs-on: self-hosted
-    # needs: [build, performance-testing, container-security]
+    needs: [build, performance-testing, container-security]
     steps:
       - uses: actions/checkout@v4
       - name: Set Image Tag
